@@ -1,112 +1,72 @@
-# InzoneH9Tray
+# InZoneH9Tray
 
 **English** | [Русский](README.ru.md)
 
-## Sony INZONE H9 / H7 Battery Tray Indicator for Windows
+Windows tray battery indicator and optional automatic audio switching for Sony INZONE H9 (WH-G900N). Based on [janit88/InZoneH9Tray](https://github.com/janit88/InZoneH9Tray).
 
-InzoneH9Tray is a lightweight Windows system tray application that displays the battery level and charging status of Sony INZONE H9 and INZONE H7 headsets.
+## Using the app
 
-The application reads the battery status directly through the USB/COM interface of the Sony wireless dongle and does not require the INZONE Hub window to remain open.
+Run `InZoneH9Tray.exe`. Right-click its tray icon:
 
-## Features
+- **Auto-switch audio output** enables/disables automatic switching. It is off on first launch; the checkbox is saved.
+- **Start with Windows** enables/disables launch when the current user signs in, without administrator rights. It is off until enabled in the menu.
+- **Refresh now** requests a refresh without starting another competing worker.
+- **Open data folder** opens settings and diagnostic logs.
+- **Exit** stops monitoring. It leaves your current audio output selected.
 
-* Displays the headset battery level in the Windows system tray.
-* Displays the charging status.
-* Automatically detects the COM port using `VID_054C&PID_0E53`.
-* Does not depend on a fixed COM port number.
-* Writes the current status to text files next to the application.
-* Displays `BUSY` when INZONE Hub is running and has occupied the COM port.
+With automatic switching enabled, connecting the headset selects **INZONE H9 / INZONE H7 - Game**. Disconnecting it returns to the most recently selected active output outside this headset. Manual output selections are remembered even while the checkbox is off. A manual selection while the headset stays connected is respected until the next connection transition.
 
-## Supported Devices
+Only the console and multimedia playback defaults are changed. Microphone selection and the communications default are preserved. Applications pinned to a specific device may need their own output set to Windows default.
 
-Tested with:
+If no remembered output is available, the app uses Windows' automatic selection among the remaining outputs. With multiple alternatives, this briefly disables the headset's active Game/Chat playback endpoints, reads Windows' choice, then restores them and applies that choice. Existing audio sessions can be interrupted during this fallback. A durable recovery file restores endpoints after an interrupted operation on the next launch. The usual remembered-output path does not disable endpoints.
 
-* Sony INZONE H9
+## Working with or without INZONE Hub
 
-Expected to also work with:
+- **Hub not running / not installed:** the app locates the USB dongle by `VID_054C&PID_0E53` and issues read-only COM queries for radio connection and battery. It releases the port after each poll.
+- **Hub running:** a bundled helper reads Hub's current connection/battery fields approximately every three seconds, including when Hub is hidden in the tray. It leaves the COM port to Hub. `%APPDATA%\Sony\INZONE Hub\ActionLog.log` provides intermediate events and a fallback if direct reading is unavailable. An empty or missing log does not prevent direct status reads.
+- If neither source provides a usable state, status is **unknown**, not disconnected; no automatic switch is performed.
 
-* Sony INZONE H7
+Hub state and logging are internal interfaces, verified with Hub 1.0.19, and may change in later versions. The helper uses ClrMD to read a small, known object graph without suspending Hub, injecting code, saving a process dump, or sending data elsewhere. Reading a running process is best-effort: two matching samples, object types, device identity and initialization flags are checked; failures leave monitoring to the log. A helper call is limited to five seconds. A confirmed COM reading is preserved for up to five seconds while Hub initializes. The app does not enable telemetry or alter Hub settings. A Hub startup coinciding with a brief direct query may require Hub to retry opening the port.
 
-Both devices use the following hardware identifier:
+The tray menu supports Windows per-monitor DPI scaling, including monitors with different scale settings.
 
-```text
-VID_054C&PID_0E53
-```
+The original H9's direct connection replies and Hub connection events have been verified on hardware. H7 shares the dongle ID but is not hardware-tested. H9 II and INZONE Buds are not supported by this protocol implementation.
 
-Support for the Sony INZONE H7 has not yet been confirmed by direct testing.
+## Tray display and files
 
-## Limitation
+| Icon | Meaning |
+| --- | --- |
+| Number | Last reported battery percentage |
+| ON | Connected; battery percentage not yet available |
+| OFF | Headset disconnected or dongle absent |
+| ? | Status unknown / waiting |
 
-INZONE Hub and InzoneH9Tray use the same COM interface of the wireless dongle.
+Data is stored under `%LOCALAPPDATA%\InZoneH9Tray`:
 
-When INZONE Hub is running, it occupies the COM port and InzoneH9Tray cannot read the battery level. In this case, the tray icon displays:
+- `settings.json`: checkbox and last external output ID.
+- `inzone_battery.txt`: percentage, removed when unavailable.
+- `inzone_battery_status.txt`: readable status and source (`Hub`, `COM`, `USB`).
+- `inzone_tray_error.log`: rotating diagnostic log.
+- `audio-recovery.json`: present only for pending endpoint restoration.
 
-```text
-BUSY
-```
+The app allows one instance per Windows session. It does not install a service or change drivers. **Start with Windows** registers the current EXE path in `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` as `InZoneH9Tray`; clearing the checkbox removes that entry. Place the EXE in its permanent location before enabling it. If you move or rename it, enable the option from the new location to update the entry. An automatic launch exits quietly if the app is already running.
 
-For continuous battery monitoring, close INZONE Hub completely, including its system tray icon.
+## Development
 
-## Installing the Prebuilt Version
-
-1. Download `InzoneH9Tray.exe` from the repository's **Releases** page.
-2. Run the downloaded file.
-3. The application icon will appear in the Windows system tray.
-4. If Windows hides the icon, click the `^` arrow and drag the icon to the visible part of the tray.
-
-## Starting with Windows
-
-1. Press `Win + R`.
-2. Enter:
-
-```text
-shell:startup
-```
-
-3. Place a shortcut to `InzoneH9Tray.exe` in the opened folder.
-
-## Building from Source
-
-Install the required dependencies:
+Requires Windows 10/11 x64, Python 3.11+ and .NET SDK 8 or newer to build the helper. The packaged EXE includes the helper runtime; users do not need to install .NET separately.
 
 ```powershell
-py -m pip install --upgrade pyserial pystray pillow pyinstaller
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
+dotnet publish hub_snapshot/HubSnapshot.csproj -c Release -o build/hub-snapshot --source https://api.nuget.org/v3/index.json
+python -m unittest discover -s tests -v
+python inzone_tray.py --diagnose
+python inzone_tray.py
 ```
 
-Build the executable:
+`--status` and `--diagnose` read device state without changing audio defaults. Close another tray instance before using them.
 
-```powershell
-py -m PyInstaller --onefile --noconsole --clean --name InzoneH9Tray --hidden-import=pystray._win32 inzone_tray.py
-```
+Build the single-file EXE with `./build.ps1` from the activated environment. It builds the helper, runs tests and embeds the helper and DPI manifest in the executable.
 
-The resulting executable will be located at:
-
-```text
-dist\InzoneH9Tray.exe
-```
-
-## Status Files
-
-The application creates the following files next to the executable:
-
-```text
-inzone_battery.txt
-inzone_battery_status.txt
-inzone_tray_error.log
-```
-
-These files can be used for diagnostics and integration with other applications or desktop widgets.
-
-## Tray Icon Statuses
-
-| Icon   | Meaning                            |
-| ------ | ---------------------------------- |
-| `70`   | Current battery level              |
-| `20`   | Low battery level                  |
-| `BUSY` | COM port is occupied by INZONE Hub |
-| `NO`   | Headset or dongle was not found    |
-| `?`    | Battery reading error              |
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
+Output: `dist\InZoneH9Tray.exe`. Tests use simulated audio devices; they do not change real Windows outputs. Audio switching uses Windows' private `IPolicyConfig` interface through pycaw, so compatibility should be checked after major Windows updates.

@@ -4,6 +4,9 @@ __pycache__/
 build/
 dist/
 *.spec
+.venv/
+bin/
+obj/
 
 inzone_battery.txt
 inzone_battery_status.txt

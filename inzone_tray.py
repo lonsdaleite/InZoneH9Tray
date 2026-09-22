@@ -1,408 +1,236 @@
-import time
+"""INZONE H9/H7 battery tray with optional automatic output switching."""
+
+import argparse
+import ctypes
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
 import threading
-import traceback
-from dataclasses import dataclass
-from datetime import datetime
+import time
+from dataclasses import asdict
 
-import serial
-from serial.tools import list_ports
+# Set this before pystray can create a window, including when run from source.
+# The packaged executable also declares PerMonitorV2 in its manifest.
+if os.name == "nt":
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
 
+import comtypes
 import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageDraw, ImageFont
 
-
-VID = "054C"
-PID = "0E53"
-
-POLL_INTERVAL_SECONDS = 60
-
-INIT_1 = bytes.fromhex("01 00 FC 08 96 C3 21 01 01 01 00 7D")
-INIT_2 = bytes.fromhex("01 00 FC 08 96 C3 41 02 01 01 00 9E")
-BATTERY_QUERY = bytes.fromhex("01 00 FC 08 96 C3 41 04 01 01 00 A0")
-
-BATTERY_SIGNATURE = bytes.fromhex("04 FF 0B 00 96 C3 14 04")
+from audio_switch import AutoSwitcher, Settings, WindowsAudio
+from inzone_monitor import HeadsetMonitor, HeadsetState
+from windows_startup import WindowsStartup
 
 
-@dataclass
-class BatteryState:
-    battery: int | None = None
-    charging: bool | None = None
-    status: str = "init"
-    port: str | None = None
-    last_update: str | None = None
-    error: str | None = None
-
-
-state = BatteryState()
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "InZoneH9Tray"
+state = HeadsetState()
+audio_message = "Auto-switch off"
 stop_event = threading.Event()
-tray_icon: pystray.Icon | None = None
+refresh_event = threading.Event()
+tray_icon = None
+settings = None
+startup = None
 
 
-def find_inzone_port() -> str | None:
-    """
-    Find the INZONE H9/H7 COM port.
-
-    On the original development PC, it was:
-    USB\\VID_054C&PID_0E53&MI_06...
-    COM3
-
-    On another PC, the COM port may be COM4, COM5, COM12, and so on.
-    Therefore, search by VID/PID instead of a specific COM port number.
-    """
-
-    candidates = []
-
-    for port in list_ports.comports():
-        text = f"{port.device} {port.description} {port.hwid}".upper()
-
-        # pyserial format:
-        # USB VID:PID=054C:0E53
-        if f"VID:PID={VID}:{PID}" in text:
-            candidates.append(port)
-            continue
-
-        # Windows PNPDeviceID format:
-        # USB\VID_054C&PID_0E53&MI_06...
-        if f"VID_{VID}" in text and f"PID_{PID}" in text:
-            candidates.append(port)
-            continue
-
-        # Fallback: loosely match both identifiers
-        if VID in text and PID in text:
-            candidates.append(port)
-            continue
-
-    # Prefer the MI_06 interface first,
-    # because the COM port was exposed through MI_06 during testing.
-    for port in candidates:
-        text = f"{port.device} {port.description} {port.hwid}".upper()
-
-        if "MI_06" in text:
-            return port.device
-
-    # If MI_06 is not shown, use the first port matching the VID/PID.
-    if candidates:
-        return candidates[0].device
-
-    return None
-
-
-def read_for(ser: serial.Serial, seconds: float = 0.8) -> bytes:
-    data = b""
-    end = time.time() + seconds
-
-    while time.time() < end:
-        waiting = ser.in_waiting
-
-        if waiting:
-            data += ser.read(waiting)
-        else:
-            chunk = ser.read(1)
-
-            if chunk:
-                data += chunk
-            else:
-                time.sleep(0.02)
-
-    return data
-
-
-def send_and_read(ser: serial.Serial, cmd: bytes, pause: float = 0.25) -> bytes:
-    ser.write(cmd)
-    time.sleep(pause)
-    return read_for(ser)
-
-
-def find_battery_frame(data: bytes) -> bytes | None:
-    for i in range(0, max(0, len(data) - 13)):
-        frame = data[i:i + 14]
-
-        if len(frame) == 14 and frame.startswith(BATTERY_SIGNATURE):
-            return frame
-
-    return None
-
-
-def read_inzone_battery() -> BatteryState:
-    port = find_inzone_port()
-
-    if not port:
-        return BatteryState(
-            status="not_found",
-            error="INZONE COM port not found"
-        )
-
-    try:
-        with serial.Serial(
-            port=port,
-            baudrate=115200,
-            bytesize=8,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=0.2,
-            write_timeout=10,
-            xonxoff=False,
-            rtscts=False,
-            dsrdtr=False
-        ) as ser:
-            ser.dtr = True
-            ser.rts = True
-
-            time.sleep(0.5)
-
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-
-            send_and_read(ser, INIT_1)
-            send_and_read(ser, INIT_2)
-
-            rx = send_and_read(ser, BATTERY_QUERY)
-
-            frame = find_battery_frame(rx)
-
-            if not frame:
-                return BatteryState(
-                    status="bad_response",
-                    port=port,
-                    error="Battery response frame not found"
-                )
-
-            charging_byte = frame[11]
-            battery_byte = frame[12]
-
-            return BatteryState(
-                battery=battery_byte,
-                charging=(charging_byte == 1),
-                status="ok",
-                port=port,
-                last_update=datetime.now().strftime("%H:%M:%S")
-            )
-
-    except PermissionError:
-        return BatteryState(
-            status="busy",
-            port=port,
-            error="COM port is busy. INZONE Hub is probably running"
-        )
-
-    except serial.SerialException as e:
-        message = str(e)
-
-        if (
-            getattr(e, "errno", None) in (5, 13)
-            or getattr(e, "winerror", None) == 5
-            or "PermissionError" in message
-            or "Access is denied" in message
-        ):
-            return BatteryState(
-                status="busy",
-                port=port,
-                error="COM port is busy. INZONE Hub is probably running"
-            )
-
-        return BatteryState(
-            status="serial_error",
-            port=port,
-            error=message
-        )
-
-    except Exception as e:
-        return BatteryState(
-            status="error",
-            port=port,
-            error=f"{type(e).__name__}: {e}"
-        )
-
-
-def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    candidates = [
-        r"C:\Windows\Fonts\arialbd.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\segoeuib.ttf",
-        r"C:\Windows\Fonts\segoeui.ttf",
-    ]
-
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size)
-        except Exception:
-            pass
-
-    return ImageFont.load_default()
-
-
-def make_icon_image(current_state: BatteryState) -> Image.Image:
-    size = 64
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-
-    if current_state.status == "ok":
-        if current_state.battery is not None and current_state.battery <= 20:
-            bg = (150, 40, 40, 255)
-        elif current_state.charging:
-            bg = (60, 110, 60, 255)
-        else:
-            bg = (90, 35, 150, 255)
-    elif current_state.status == "busy":
-        bg = (120, 90, 30, 255)
+def describe(value):
+    if value.connected is False:
+        text = "Headset disconnected"
+    elif value.connected is True:
+        text = f"Battery {value.battery}%" if value.battery is not None else "Headset connected"
+        if value.charging:
+            text += " / charging"
     else:
-        bg = (80, 80, 80, 255)
+        text = value.error or "Waiting for headset status"
+    return text + (f" [{value.source}]" if value.source else "")
 
-    draw.rounded_rectangle((2, 2, 62, 62), radius=12, fill=bg)
 
-    if current_state.status == "ok" and current_state.battery is not None:
-        text = str(current_state.battery)
-
-        font_size = 25 if current_state.battery >= 100 else 31
-        font = load_font(font_size)
-
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-
-        x = (size - text_w) // 2
-        y = (size - text_h) // 2 - 3
-
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
-
-        if current_state.charging:
-            small_font = load_font(16)
-            draw.text((47, 43), "⚡", font=small_font, fill=(255, 255, 255, 255))
-
-    elif current_state.status == "busy":
-        font = load_font(16)
-        text = "BUSY"
-        bbox = draw.textbbox((0, 0), text, font=font)
-
-        draw.text(
-            ((size - (bbox[2] - bbox[0])) // 2, (size - (bbox[3] - bbox[1])) // 2),
-            text,
-            font=font,
-            fill=(255, 255, 255, 255)
-        )
-
-    elif current_state.status == "not_found":
-        font = load_font(18)
-        text = "NO"
-        bbox = draw.textbbox((0, 0), text, font=font)
-
-        draw.text(
-            ((size - (bbox[2] - bbox[0])) // 2, (size - (bbox[3] - bbox[1])) // 2),
-            text,
-            font=font,
-            fill=(255, 255, 255, 255)
-        )
-
+def make_icon(value):
+    picture = Image.new("RGBA", (64, 64))
+    draw = ImageDraw.Draw(picture)
+    if value.connected is True:
+        color = (60, 110, 60) if value.charging else (90, 35, 150)
+        if value.battery is not None and value.battery <= 20:
+            color = (150, 40, 40)
+        text = str(value.battery) if value.battery is not None else "ON"
     else:
-        font = load_font(22)
-        text = "?"
-        bbox = draw.textbbox((0, 0), text, font=font)
-
-        draw.text(
-            ((size - (bbox[2] - bbox[0])) // 2, (size - (bbox[3] - bbox[1])) // 2 - 2),
-            text,
-            font=font,
-            fill=(255, 255, 255, 255)
-        )
-
-    return image
-
-
-def make_title(current_state: BatteryState) -> str:
-    if current_state.status == "ok":
-        charging_text = " / charging" if current_state.charging else ""
-        port_text = f" / {current_state.port}" if current_state.port else ""
-
-        return f"INZONE H9: {current_state.battery}%{charging_text}{port_text} | {current_state.last_update}"
-
-    if current_state.status == "busy":
-        return f"INZONE H9: COM port is in use by INZONE Hub ({current_state.port})"
-
-    if current_state.status == "not_found":
-        return "INZONE H9: device not found"
-
-    return f"INZONE H9: error — {current_state.error}"
-
-
-def save_status_file(current_state: BatteryState) -> None:
+        color = (80, 80, 80)
+        text = "OFF" if value.connected is False else "?"
+    draw.rounded_rectangle((2, 2, 62, 62), radius=12, fill=color)
+    size = 25 if len(text) >= 3 else 31
     try:
-        with open("inzone_battery_status.txt", "w", encoding="utf-8") as f:
-            f.write(make_title(current_state))
+        font = ImageFont.truetype(r"C:\Windows\Fonts\segoeuib.ttf", size)
+    except OSError:
+        font = ImageFont.load_default()
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    draw.text(((64 - (right - left)) / 2 - left,
+               (64 - (bottom - top)) / 2 - top), text, font=font, fill="white")
+    return picture
 
-        if current_state.battery is not None:
-            with open("inzone_battery.txt", "w", encoding="utf-8") as f:
-                f.write(str(current_state.battery))
 
+def save_status(value):
+    (DATA_DIR / "inzone_battery_status.txt").write_text(describe(value), encoding="utf-8")
+    battery_file = DATA_DIR / "inzone_battery.txt"
+    if value.connected is True and value.battery is not None:
+        battery_file.write_text(str(value.battery), encoding="utf-8")
+    else:
+        battery_file.unlink(missing_ok=True)
+
+
+def worker_loop():
+    global state, audio_message
+    comtypes.CoInitialize()
+    try:
+        monitor = HeadsetMonitor()
+        switcher = None
+        audio_retry_at = 0.0
+        last_display = None
+        while not stop_event.is_set():
+            try:
+                state = monitor.poll()
+                if switcher is None and time.monotonic() >= audio_retry_at:
+                    try:
+                        audio = WindowsAudio(DATA_DIR / "audio-recovery.json")
+                        audio.recover()
+                        switcher = AutoSwitcher(audio, settings)
+                    except Exception:
+                        logging.exception("Audio initialization/recovery failed")
+                        audio_message = "Audio unavailable; retrying (see diagnostic log)"
+                        audio_retry_at = time.monotonic() + 5
+                if switcher is not None:
+                    switcher.update(state.connected)
+                    audio_message = switcher.message
+                display = (describe(state), audio_message)
+                if display != last_display:
+                    logging.info("%s; %s", *display)
+                    save_status(state)
+                    tray_icon.icon = make_icon(state)
+                    tray_icon.title = ("INZONE H9/H7: " + display[0])[:127]
+                    tray_icon.update_menu()
+                    last_display = display
+            except Exception:
+                logging.exception("Refresh failed")
+                state = HeadsetState(error="Refresh failed; see diagnostic log")
+                tray_icon.title = "INZONE: refresh failed; see diagnostic log"
+                tray_icon.icon = make_icon(state)
+            refresh_event.wait(1.0)
+            refresh_event.clear()
     except Exception:
-        pass
+        logging.exception("Audio initialization/recovery failed")
+        audio_message = "Audio unavailable; see diagnostic log and restart"
+        tray_icon.title = "INZONE: initialization failed; see diagnostic log"
+        tray_icon.update_menu()
+    finally:
+        comtypes.CoUninitialize()
 
 
-def update_tray_icon(current_state: BatteryState) -> None:
-    global tray_icon
-
-    if tray_icon is None:
-        return
-
-    tray_icon.icon = make_icon_image(current_state)
-    tray_icon.title = make_title(current_state)
-
-
-def refresh_once() -> None:
-    global state
-
-    new_state = read_inzone_battery()
-    state = new_state
-
-    save_status_file(new_state)
-    update_tray_icon(new_state)
+def on_toggle(icon, menu_item):
+    try:
+        settings.set("auto_switch", not settings.get("auto_switch"))
+        refresh_event.set()
+        icon.update_menu()
+    except OSError:
+        logging.exception("Cannot save auto-switch setting")
+        icon.notify("Cannot save the auto-switch setting. See the diagnostic log.")
 
 
-def worker_loop() -> None:
-    while not stop_event.is_set():
-        try:
-            refresh_once()
-        except Exception:
-            with open("inzone_tray_error.log", "a", encoding="utf-8") as f:
-                f.write(traceback.format_exc())
-                f.write("\n")
+def startup_checked(menu_item):
+    try:
+        return startup.enabled()
+    except OSError:
+        logging.exception("Cannot read Windows startup setting")
+        return False
 
-        stop_event.wait(POLL_INTERVAL_SECONDS)
+
+def on_startup_toggle(icon, menu_item):
+    try:
+        startup.set_enabled(not startup.enabled())
+    except (OSError, ValueError) as exc:
+        logging.exception("Cannot change Windows startup setting")
+        icon.notify(f"Cannot change Windows startup: {exc}")
+    finally:
+        icon.update_menu()
 
 
 def on_refresh(icon, menu_item):
-    threading.Thread(target=refresh_once, daemon=True).start()
+    refresh_event.set()
 
 
 def on_exit(icon, menu_item):
     stop_event.set()
+    refresh_event.set()
     icon.stop()
 
 
-def get_menu_text():
-    return make_title(state)
+def acquire_instance():
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel.CreateMutexW(None, False, "Local\\InZoneH9Tray.Monitor")
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle(handle)
+        return None
+    return handle
 
 
 def main():
-    global tray_icon
-
-    initial_state = BatteryState(status="init", error="Initializing")
-
-    tray_icon = pystray.Icon(
-        "INZONE H9 Battery",
-        make_icon_image(initial_state),
-        "INZONE H9: starting...",
-        menu=pystray.Menu(
-            item(lambda text: get_menu_text(), None, enabled=False),
-            item("Refresh now", on_refresh),
-            item("Exit", on_exit)
-        )
-    )
-
-    thread = threading.Thread(target=worker_loop, daemon=True)
-    thread.start()
-
-    tray_icon.run()
+    global tray_icon, settings, startup
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--status", action="store_true", help="Read one status sample without changing audio")
+    parser.add_argument("--diagnose", action="store_true", help="Read status and available audio outputs as JSON")
+    parser.add_argument("--autostart", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    handle = acquire_instance()
+    if handle is None:
+        if args.status or args.diagnose:
+            print(json.dumps({"error": "Another InZoneH9Tray instance is running"}))
+        elif not args.autostart:
+            ctypes.windll.user32.MessageBoxW(None, "InZoneH9Tray is already running.", "INZONE", 0)
+        return
+    try:
+        if args.status or args.diagnose:
+            result = {"headset": asdict(HeadsetMonitor().poll())}
+            if args.diagnose:
+                audio = WindowsAudio(DATA_DIR / "audio-recovery.json")
+                result.update(outputs=[asdict(d) for d in audio.outputs()], default=audio.default())
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(DATA_DIR / "inzone_tray_error.log", maxBytes=512_000,
+                                      backupCount=2, encoding="utf-8")
+        logging.basicConfig(level=logging.INFO, handlers=[handler],
+                            format="%(asctime)s %(levelname)s %(message)s")
+        settings = Settings(DATA_DIR / "settings.json")
+        startup = WindowsStartup()
+        tray_icon = pystray.Icon(
+            "InZoneH9Tray", make_icon(state), "INZONE: starting...",
+            menu=pystray.Menu(
+                item(lambda _: describe(state), None, enabled=False),
+                item("Auto-switch audio output", on_toggle,
+                     checked=lambda _: settings.get("auto_switch")),
+                item(lambda _: audio_message, None, enabled=False),
+                item("Start with Windows", on_startup_toggle, checked=startup_checked),
+                item("Refresh now", on_refresh),
+                item("Open data folder", lambda *_: os.startfile(DATA_DIR)),
+                item("Exit", on_exit)))
+        thread = threading.Thread(target=worker_loop, name="INZONE monitor", daemon=False)
+        thread.start()
+        try:
+            tray_icon.run()
+        finally:
+            stop_event.set()
+            refresh_event.set()
+            thread.join()
+    finally:
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle(handle)
 
 
 if __name__ == "__main__":
